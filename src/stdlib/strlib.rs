@@ -3,14 +3,15 @@ use std::{
     cmp::Ordering,
     io::{Cursor, Write},
     num::ParseIntError,
+    pin::Pin,
 };
 
-use gc_arena::Gc;
+use gc_arena::{Collect, Gc};
 use thiserror::Error;
 
 use crate::{
     meta_ops::{self, MetaResult},
-    Context, Error, Function, Value,
+    Context, Error, FromValue, Function, Sequence, SequencePoll, Value,
 };
 
 #[derive(Debug, Error)]
@@ -107,7 +108,7 @@ enum OptionalArg {
     Arg,
     Specified(u8),
 }
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct CommonFormatArgs {
     width: usize,
     precision: Option<usize>,
@@ -685,113 +686,250 @@ fn write_value<'gc, W: Write>(
     })
 }
 
-enum FormatState {
+pub fn string_format<'gc>(
+    ctx: Context<'gc>,
+    stack: crate::Stack<'gc, '_>,
+) -> Result<impl Sequence<'gc>, Error<'gc>> {
+    let str = crate::string::String::from_value(ctx, stack.get(0))?;
+    Ok(FormatState::Start {
+        buf: Vec::new(),
+        arg_count: stack.len(),
+        str,
+        index: 0,
+        value_index: 1,
+    })
+}
+
+impl<'gc> Sequence<'gc> for FormatState<'gc> {
+    fn poll(
+        self: Pin<&mut Self>,
+        ctx: Context<'gc>,
+        _exec: crate::Execution<'gc, '_>,
+        stack: crate::Stack<'gc, '_>,
+    ) -> Result<SequencePoll<'gc>, Error<'gc>> {
+        step(ctx, self.get_mut(), stack)
+    }
+}
+#[derive(Collect)]
+#[collect(no_drop)]
+enum FormatState<'gc> {
     Start {
-        str: &'static [u8],
+        buf: Vec<u8>,
+        arg_count: usize,
+        str: crate::string::String<'gc>,
         index: usize,
         value_index: usize,
     },
     EvaluateSpecifier {
-        str: &'static [u8],
+        buf: Vec<u8>,
+        arg_count: usize,
+        str: crate::string::String<'gc>,
         index: usize,
         value_index: usize,
+        #[collect(require_static)]
         spec: FormatSpecifier,
     },
-    End,
+    EvaluateCallback {
+        buf: Vec<u8>,
+        arg_count: usize,
+        str: crate::string::String<'gc>,
+        index: usize,
+        value_index: usize,
+        #[collect(require_static)]
+        spec: FormatSpecifier,
+        #[collect(require_static)]
+        dest: EvalContinuation,
+    },
+    End(Vec<u8>),
 }
-fn step<'gc, W: Write>(
+fn step<'gc>(
     ctx: Context<'gc>,
-    w: &mut W,
-    state: &mut FormatState,
-    values: &[Value<'gc>],
-) -> Result<(), Error<'gc>> {
+    state: &mut FormatState<'gc>,
+    mut stack: crate::Stack<'gc, '_>,
+) -> Result<SequencePoll<'gc>, Error<'gc>> {
     let mut float_buf = [0u8; 300];
 
     loop {
         match *state {
             FormatState::Start {
+                ref mut buf,
+                arg_count,
                 str,
                 mut index,
                 value_index,
             } => {
                 if let Some(next) = memchr(FMT_SPEC, &str[index..]).map(|n| n + index) {
                     if next != index {
-                        w.write_all(&str[index..next])?;
+                        buf.write_all(&str[index..next])?;
                     }
 
-                    let (spec, spec_end) = parse_specifier(str, next)?;
+                    let (spec, spec_end) = parse_specifier(str.as_bytes(), next)?;
                     index = spec_end;
                     assert!(index > next);
 
                     *state = FormatState::EvaluateSpecifier {
+                        buf: std::mem::take(buf),
+                        arg_count,
                         str,
                         index,
                         value_index,
                         spec,
                     };
                 } else {
-                    if index < str.len() {
-                        w.write_all(&str[index..])?;
+                    if index < str.as_bytes().len() {
+                        buf.write_all(&str[index..])?;
                     }
-                    *state = FormatState::End;
+                    *state = FormatState::End(std::mem::take(buf));
                 }
             }
             FormatState::EvaluateSpecifier {
+                ref mut buf,
+                arg_count,
                 str,
                 index,
                 mut value_index,
                 spec,
             } => {
-                let mut values_iter = values.iter();
-                evaluate_specifier(
+                let mut values_iter = stack[value_index..arg_count].iter();
+                let poll = evaluate_specifier(
                     ctx,
-                    w,
+                    &mut *buf,
                     spec,
                     &mut (&mut values_iter).copied(),
                     &mut float_buf,
                 )?;
-                value_index = values.as_ptr() as usize - values_iter.as_slice().as_ptr() as usize;
+                value_index = (values_iter.as_slice().as_ptr() as usize
+                    - stack[value_index..arg_count].as_ptr() as usize)
+                    / std::mem::size_of::<Value>();
+
+                match poll {
+                    EvalPoll::Done => (),
+                    EvalPoll::Call { call, then } => {
+                        *state = FormatState::EvaluateCallback {
+                            buf: std::mem::take(buf),
+                            arg_count,
+                            str,
+                            index,
+                            value_index,
+                            spec,
+                            dest: then,
+                        };
+                        let bottom = stack.len();
+                        stack.extend(call.args);
+                        return Ok(SequencePoll::Call {
+                            function: call.function,
+                            bottom,
+                        });
+                    }
+                }
 
                 *state = FormatState::Start {
+                    buf: std::mem::take(buf),
+                    arg_count,
                     str,
                     index,
                     value_index,
                 };
             }
-            FormatState::End => {
-                return Ok(());
+            FormatState::EvaluateCallback {
+                ref mut buf,
+                arg_count,
+                str,
+                index,
+                mut value_index,
+                spec,
+                dest,
+            } => {
+                let result = stack.get(arg_count);
+                stack.resize(arg_count);
+
+                let mut values_iter = stack[value_index..arg_count].iter();
+                let poll = evaluate_continuation(
+                    ctx,
+                    &mut *buf,
+                    dest,
+                    spec,
+                    Some(result),
+                    &mut (&mut values_iter).copied(),
+                    &mut float_buf,
+                )?;
+                value_index = stack[value_index..arg_count].as_ptr() as usize
+                    - values_iter.as_slice().as_ptr() as usize;
+
+                match poll {
+                    EvalPoll::Done => (),
+                    EvalPoll::Call { call, then } => {
+                        *state = FormatState::EvaluateCallback {
+                            buf: std::mem::take(buf),
+                            arg_count,
+                            str,
+                            index,
+                            value_index,
+                            spec,
+                            dest: then,
+                        };
+                        let bottom = stack.len();
+                        stack.extend(call.args);
+                        return Ok(SequencePoll::Call {
+                            function: call.function,
+                            bottom,
+                        });
+                    }
+                }
+                *state = FormatState::Start {
+                    buf: std::mem::take(buf),
+                    arg_count,
+                    str,
+                    index,
+                    value_index,
+                };
+            }
+            FormatState::End(ref mut buf) => {
+                stack.replace(ctx, ctx.intern(&std::mem::take(buf)));
+                return Ok(SequencePoll::Return);
             }
         };
     }
 }
 
-pub fn string_format<'gc, W: Write>(
+enum EvalPoll<'gc> {
+    Done,
+    Call {
+        call: meta_ops::MetaCall<'gc, 1>,
+        then: EvalContinuation,
+    },
+}
+
+#[derive(Copy, Clone)]
+enum EvalContinuation {
+    ToStringResult(CommonFormatArgs),
+}
+
+fn evaluate_continuation<'gc, W: Write>(
     ctx: Context<'gc>,
     w: &mut W,
-    str: &[u8],
-    mut values: impl Iterator<Item = Value<'gc>>,
-) -> Result<usize, Error<'gc>> {
-    let mut float_buf = [0u8; 300];
+    cont: EvalContinuation,
+    spec: FormatSpecifier,
+    result: Option<Value<'gc>>,
+    _values: &mut impl Iterator<Item = Value<'gc>>,
+    _float_buf: &mut [u8; 300],
+) -> Result<EvalPoll<'gc>, Error<'gc>> {
+    match cont {
+        EvalContinuation::ToStringResult(args) => {
+            let val = result.unwrap_or_default();
+            let string = val
+                .into_string(ctx)
+                .ok_or_else(|| FormatError::BadValueType(spec.spec, "string", val.type_name()))?;
 
-    let mut index = 0;
+            let len = string.len() as usize;
+            let truncated_len = args.precision.unwrap_or(len).min(len);
 
-    while let Some(next) = memchr(FMT_SPEC, &str[index..]).map(|n| n + index) {
-        if next != index {
-            w.write_all(&str[index..next])?;
+            let pad = args.pad_num_before(w, truncated_len, 0, b"")?;
+            w.write_all(&string[..truncated_len])?;
+            pad.finish_pad(w)?;
         }
-
-        let (spec, spec_end) = parse_specifier(str, next)?;
-        index = spec_end;
-        assert!(index > next);
-
-        evaluate_specifier(ctx, w, spec, &mut values, &mut float_buf)?;
     }
-
-    if index < str.len() {
-        w.write_all(&str[index..])?;
-    }
-
-    Ok(0)
+    Ok(EvalPoll::Done)
 }
 
 fn evaluate_specifier<'gc, W: Write>(
@@ -800,7 +938,7 @@ fn evaluate_specifier<'gc, W: Write>(
     spec: FormatSpecifier,
     values: &mut impl Iterator<Item = Value<'gc>>,
     float_buf: &mut [u8; 300],
-) -> Result<(), Error<'gc>> {
+) -> Result<EvalPoll<'gc>, Error<'gc>> {
     match spec.spec {
         b'%' => {
             spec.check_flags(Flags::NONE)?;
@@ -826,9 +964,11 @@ fn evaluate_specifier<'gc, W: Write>(
             let val = spec.next_value(values)?;
             let val = match meta_ops::tostring(ctx, val)? {
                 MetaResult::Value(val) => val,
-                MetaResult::Call(_) => {
-                    // this makes the entire thing a state machine...
-                    todo!("support tostring calls")
+                MetaResult::Call(call) => {
+                    return Ok(EvalPoll::Call {
+                        call,
+                        then: EvalContinuation::ToStringResult(args),
+                    });
                 }
             };
             let string = val
@@ -976,5 +1116,5 @@ fn evaluate_specifier<'gc, W: Write>(
         }
         c => return Err(FormatError::BadSpec(c).into()),
     }
-    Ok(())
+    Ok(EvalPoll::Done)
 }
