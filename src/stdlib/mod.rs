@@ -3,6 +3,7 @@ mod coroutine;
 mod io;
 mod math;
 mod string;
+mod strlib;
 mod table;
 
 pub use self::{
