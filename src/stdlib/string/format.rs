@@ -10,10 +10,13 @@
 //!
 //! Supported specifiers:
 //! - `%%`
-//! - `%c` - print byte (mod 256)
-//! - `%s` - print string (prints raw bytes, does not reinterpret as utf8)
-//! - `%d`, `%i` - print signed integer
-//! - `%u` - print unsigned int (cast to 64 bit signed integer, then interpreted as unsigned)
+//! - `%c` - raw byte (mod 256)
+//! - `%C` - format a unicode code point as utf8
+//! - `%s` - string (prints raw bytes, does not reinterpret as utf8)
+//! - `%S` - utf8 string; width and precision are in terms of codepoints
+//! - `%d`, `%i` - signed integer
+//! - `%u` - unsigned int (converted to 64 bit signed integer, then
+//!          interpreted as unsigned)
 //! - `%o` - usigned octal int
 //! - `%x`, `%X` - unsigned hex int
 //! - `%b`, `%B` - unsigned binary int
@@ -21,12 +24,9 @@
 //! - `%f`, `%F` - normal form floating point
 //! - `%e`, `%E` - exponential form floating point
 //! - `%a`, `%A` - hexidecimal floating point
-//! - `%p` - print a lua value as a pointer, for non-literal values
-//! - `%q` - print escaped lua literal; nil, bool, string, integer, or float (formatted as a hex float)
-//!
-//! Potential future additions
-//! - `%C` - print unicode character as utf8
-//! - `%S` - unicode-aware alias of `%s`
+//! - `%p` - format a value as a pointer, for non-literal values
+//! - `%q` - format a value as an escaped lua literal; nil, bool,
+//!          string, integer, or float (formatted as a hex float)
 //!
 //! Supported flags:
 //! - `-`: left align
@@ -68,6 +68,10 @@
 //!   other bytes.
 //! - (Matching PRLua) No support for C style value length specifiers.
 //! - (Matching PRLua) No support for `%n` (length write-back)
+//! - Supports `%C` to format a unicode code point as UTF-8.
+//!   (in C, this is either `%C` or `%lc`, if the locale supports it)
+//! - Supports `%S`, a unicode-aware variant of `%s`; width and precision
+//!   are specified in terms of codepoints rather than bytes.
 
 use std::{
     char,
@@ -102,6 +106,8 @@ enum FormatError {
     ValueOutOfRange(u8),
     #[error("weird floating point value?")]
     BadFloat,
+    #[error("Non-utf8 string passed to specifier {:?}", *.0 as char)]
+    NonUnicodeString(u8),
 }
 
 const FMT_SPEC: u8 = b'%';
@@ -817,11 +823,20 @@ enum EvalPoll<'gc> {
         then: EvalContinuation,
     },
 }
+impl<'gc> EvalPoll<'gc> {
+    fn from_metaresult(res: MetaResult<'gc, 1>, then: EvalContinuation) -> Self {
+        match res {
+            MetaResult::Value(value) => EvalPoll::PassValue { value, then },
+            MetaResult::Call(call) => EvalPoll::Call { call, then },
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 enum EvalContinuation {
     Init,
     ToStringResult(FormatArgs),
+    UnicodeToStringResult(FormatArgs),
 }
 
 fn evaluate_continuation<'gc, W: Write>(
@@ -845,6 +860,28 @@ fn evaluate_continuation<'gc, W: Write>(
 
             let pad = args.pad_num_before(w, truncated_len, 0, b"")?;
             w.write_all(&string[..truncated_len])?;
+            pad.finish_pad(w)?;
+            Ok(EvalPoll::Done)
+        }
+        EvalContinuation::UnicodeToStringResult(args) => {
+            let val = result.unwrap_or_default();
+            let string = val
+                .into_string(ctx)
+                .ok_or_else(|| FormatError::BadValueType(spec.spec, "string", val.type_name()))?;
+
+            let string = std::str::from_utf8(string.as_bytes())
+                .map_err(|_| FormatError::NonUnicodeString(spec.spec))?;
+
+            let precision = args.precision.unwrap_or(string.len());
+            let (end_byte, end_char) = string
+                .char_indices()
+                .map(|(i, c)| i + c.len_utf8())
+                .zip(1..precision + 1)
+                .last()
+                .unwrap_or((0, 0));
+
+            let pad = args.pad_num_before(w, end_char, 0, b"")?;
+            w.write_all(&string[..end_byte].as_bytes())?;
             pad.finish_pad(w)?;
             Ok(EvalPoll::Done)
         }
@@ -876,24 +913,45 @@ fn evaluate_specifier<'gc, W: Write>(
             w.write_all(&[byte])?;
             pad.finish_pad(w)?;
         }
+        b'C' => {
+            // wide char
+            spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH)?;
+            let args = spec.common_args(values)?;
+
+            let int = spec.next_int(values)?;
+            let c: char = int
+                .try_into()
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| FormatError::ValueOutOfRange(spec.spec))?;
+
+            let pad = args.pad_num_before(w, 1, 0, b"")?;
+            let s = c.encode_utf8(float_buf);
+            w.write_all(s.as_bytes())?;
+            pad.finish_pad(w)?;
+        }
         b's' => {
             // string
             spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH | Flags::PRECISION)?;
             let args = spec.common_args(values)?;
-
             let val = spec.next_value(values)?;
-            let poll = match meta_ops::tostring(ctx, val)? {
-                MetaResult::Value(value) => EvalPoll::PassValue {
-                    value,
-                    then: EvalContinuation::ToStringResult(args),
-                },
-                MetaResult::Call(call) => EvalPoll::Call {
-                    call,
-                    then: EvalContinuation::ToStringResult(args),
-                },
-            };
             // Continue in `evaluate_continuation`
-            return Ok(poll);
+            return Ok(EvalPoll::from_metaresult(
+                meta_ops::tostring(ctx, val)?,
+                EvalContinuation::ToStringResult(args),
+            ));
+        }
+        b'S' => {
+            // utf-8 string
+            spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH | Flags::PRECISION)?;
+            spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH | Flags::PRECISION)?;
+            let args = spec.common_args(values)?;
+            let val = spec.next_value(values)?;
+            // Continue in `evaluate_continuation`
+            return Ok(EvalPoll::from_metaresult(
+                meta_ops::tostring(ctx, val)?,
+                EvalContinuation::UnicodeToStringResult(args),
+            ));
         }
         b'd' | b'i' => {
             // signed int

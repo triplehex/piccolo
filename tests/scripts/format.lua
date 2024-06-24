@@ -206,6 +206,11 @@ do -- string width, truncating
     assert_eq(string.format("%13.4a", 0x1.000081p+0), "  0x1.0001p+0")
     assert_eq(string.format("%13.4a", 0x1.00007fp+0), "  0x1.0000p+0")
 
+    -- Round to even
+    assert_eq(string.format("%13.4a", 0x1.00018p+0), "  0x1.0002p+0")
+    assert_eq(string.format("%13.4a", 0x1.000181p+0), "  0x1.0002p+0")
+    assert_eq(string.format("%13.4a", 0x1.00017fp+0), "  0x1.0001p+0")
+
     assert_eq(string.format("%13a", math.pi), "0x1.921fb54442d18p+1")
     assert_eq(string.format("%013.1a", math.pi), "0x000001.9p+1")
     assert_eq(string.format("%013.0a", math.pi), "0x00000002p+1")
@@ -284,4 +289,14 @@ do
     -- TODO: impl load, make sure values round-trip
     -- assert_eq(string.format("%q", math.mininteger), "0x8000000000000000")
     -- assert_eq(string.format("%q", math.mininteger), "(-9223372036854775807-1)")
+end
+
+-- TODO: would be nice to have runtime detection, to disable this when
+-- running PRLua
+if false then
+    assert_eq(string.format("%.2S", "aa😀bb"), "aa")
+    assert_eq(string.format("%.3S", "aa😀bb"), "aa😀")
+    assert_eq(string.format("%S", "aa😀bb"), "aa😀bb")
+
+    assert_eq(string.format("%C", 0x1F600), "😀")
 end
