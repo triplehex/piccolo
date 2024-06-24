@@ -668,6 +668,7 @@ fn step<'gc>(
                 let result = stack.get(state.arg_count);
                 stack.resize(state.arg_count);
 
+                let remaining_args = state.arg_count - state.value_index;
                 let mut values_iter = stack[state.value_index..state.arg_count].iter();
                 let poll = evaluate_continuation(
                     ctx,
@@ -678,9 +679,7 @@ fn step<'gc>(
                     &mut (&mut values_iter).copied(),
                     &mut float_buf,
                 )?;
-                state.value_index = (values_iter.as_slice().as_ptr() as usize
-                    - stack[state.value_index..state.arg_count].as_ptr() as usize)
-                    / std::mem::size_of::<Value>();
+                state.value_index += remaining_args - values_iter.as_slice().len();
 
                 match poll {
                     EvalPoll::Done => (),
@@ -955,7 +954,7 @@ mod parse {
             v
         }
         fn cur_index(&self) -> usize {
-            self.cur.as_ptr() as usize - self.base.as_ptr() as usize
+            self.base.len() - self.cur.len()
         }
     }
 
