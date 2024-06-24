@@ -454,6 +454,28 @@ fn write_float<'gc, W: Write>(
     Ok(())
 }
 
+const F64_EXPONENT_BITS: u32 = 11;
+const F64_MANTISSA_BITS: u32 = 52;
+
+fn round_mantissa(mantissa: u64, exp_bits: u16, precision: usize) -> (u64, u64) {
+    let leading_bit = (exp_bits != 0) as u64;
+    let mantissa = mantissa | (leading_bit << F64_MANTISSA_BITS);
+    let used_mantissa_bits = (precision as u32 * 4).min(F64_MANTISSA_BITS);
+
+    let remainder_bits = F64_MANTISSA_BITS - used_mantissa_bits as u32;
+    let quotient = mantissa >> remainder_bits;
+    let remainder = mantissa & ((1 << remainder_bits) - 1);
+    let rounded_quotient = match remainder.cmp(&(1 << (remainder_bits.saturating_sub(1)))) {
+        Ordering::Less => quotient,
+        Ordering::Equal => (quotient + 1) & !1, // Round to even
+        Ordering::Greater => quotient + 1,
+    };
+
+    let head = rounded_quotient >> used_mantissa_bits;
+    let rounded_div_mantissa = rounded_quotient & ((1 << used_mantissa_bits) - 1);
+    (head, rounded_div_mantissa)
+}
+
 fn write_hex_float<W: Write>(
     w: &mut W,
     float: f64,
@@ -467,48 +489,21 @@ fn write_hex_float<W: Write>(
     }
 
     let width = args.width;
-    let precision = args
+    let mut precision = args
         .precision
         .unwrap_or(F64_MANTISSA_BITS.div_ceil(4) as usize);
 
-    // TODO: test subnormals
-    let mut head = !(f64::is_subnormal(float) || float == 0.0) as usize;
-
-    const F64_EXPONENT_BITS: u32 = 11;
-    const F64_MANTISSA_BITS: u32 = 52;
-
     let bits = f64::to_bits(float);
     let exp_bits = (bits >> F64_MANTISSA_BITS) & ((1 << F64_EXPONENT_BITS) - 1);
-    let mut exp = exp_bits as i16 - ((1 << (F64_EXPONENT_BITS - 1)) - 1);
+    // clamp exponent to -1022 for subnormals
+    let mut exp = (exp_bits as i16 - ((1 << (F64_EXPONENT_BITS - 1)) - 1)).max(-1022);
     let mantissa = bits & ((1 << F64_MANTISSA_BITS) - 1);
 
     if float == 0.0 {
         exp = 0;
     }
 
-    let used_mantissa_bits = precision * 4;
-    let mantissa = match used_mantissa_bits as u32 {
-        0 => {
-            head = match mantissa.cmp(&(1 << (F64_MANTISSA_BITS - 1))) {
-                Ordering::Less => 1,
-                Ordering::Equal => 2, // Round to even
-                Ordering::Greater => 2,
-            };
-            0
-        }
-        F64_MANTISSA_BITS => mantissa,
-        1..=F64_MANTISSA_BITS => {
-            let remaining_bits = F64_MANTISSA_BITS - used_mantissa_bits as u32;
-            let base = mantissa >> remaining_bits;
-            let remaining = mantissa & ((1 << remaining_bits) - 1);
-            match remaining.cmp(&(1 << (remaining_bits - 1))) {
-                Ordering::Less => base,
-                Ordering::Equal => (base + 1) & !1, // Round to even
-                Ordering::Greater => base + 1,
-            }
-        }
-        _ => mantissa,
-    };
+    let (head, mut mantissa) = round_mantissa(mantissa, exp_bits as u16, precision);
 
     let prefix: &[u8] = match (sign, args.upper) {
         (b"", false) => b"0x",
@@ -526,6 +521,12 @@ fn write_hex_float<W: Write>(
     } else {
         0
     };
+
+    if args.precision.is_none() {
+        let trailing_zero_digits = mantissa.trailing_zeros().min(F64_MANTISSA_BITS) / 4;
+        mantissa = mantissa >> (trailing_zero_digits * 4);
+        precision = precision.saturating_sub(trailing_zero_digits as usize);
+    }
 
     if precision != 0 {
         let m_width = precision;
