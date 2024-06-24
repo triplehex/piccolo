@@ -65,6 +65,11 @@
 //!       may have rounding errors.
 //! - PRLua does not support `%F` (uppercase float; only differs in inf/nan case)
 //! - PRLua does not support the C23 `%b`/`%B` (binary unsigned int) specifiers
+//! - PRLua's `%q` represents math.mininteger as `0x8000000000000000`, but
+//!   piccolo represents it as `(-9223372036854775807-1)`
+//! - PRLua's `%q` passes any byte above 127 through as a raw byte; this
+//!   implementation passes through valid UTF-8 codepoints, but escapes
+//!   other bytes.
 
 use std::{
     char,
@@ -102,6 +107,7 @@ enum FormatError {
 }
 
 const FMT_SPEC: u8 = b'%';
+const ARG_MAX: u32 = 99;
 
 // TODO: useful Debug impl for flags for errors?
 #[derive(Debug, Default, Copy, Clone)]
@@ -151,7 +157,7 @@ struct FormatSpecifier {
 enum OptionalArg {
     None,
     Arg,
-    Specified(u8),
+    Specified(u32),
 }
 #[derive(Default, Clone, Copy)]
 struct FormatArgs {
@@ -172,12 +178,6 @@ impl FormatSpecifier {
             Ok(())
         }
     }
-    // Gets an argument for a format specifier (width/precision, popping
-    // from the value stack if needed.
-    //
-    // Limited to 255, but returned as usize for convenience.
-    //
-    // Returns the argument value, and a boolean of whether it was negative.
     fn get_arg<'gc>(
         &self,
         arg: OptionalArg,
@@ -188,11 +188,11 @@ impl FormatSpecifier {
             OptionalArg::Arg => {
                 let int = self.next_int(values)?;
                 let negative = int < 0;
-                let byte: u8 = int
-                    .abs()
-                    .try_into()
-                    .map_err(|_| FormatError::ValueOutOfRange(self.spec))?;
-                Ok((Some(byte as usize), negative))
+                let abs = int.unsigned_abs();
+                if abs > ARG_MAX as u64 {
+                    return Err(FormatError::ValueOutOfRange(self.spec));
+                }
+                Ok((Some(abs as usize), negative))
             }
             OptionalArg::Specified(val) => Ok((Some(val as usize), false)),
         }
@@ -502,6 +502,12 @@ fn write_float<'gc, W: Write>(
 
 const F64_EXPONENT_BITS: u32 = 11;
 const F64_MANTISSA_BITS: u32 = 52;
+const F64_EXP_OFFSET: i16 = -(1 << (F64_EXPONENT_BITS - 1)) + 1;
+
+#[inline]
+const fn bitselect(n: u64, off: u32, count: u32) -> u64 {
+    (n >> off) & ((1 << count) - 1)
+}
 
 fn round_mantissa(mantissa: u64, exp_bits: u16, precision: usize) -> (u64, u64) {
     let leading_bit = (exp_bits != 0) as u64;
@@ -510,15 +516,15 @@ fn round_mantissa(mantissa: u64, exp_bits: u16, precision: usize) -> (u64, u64) 
 
     let remainder_bits = F64_MANTISSA_BITS - used_mantissa_bits as u32;
     let quotient = mantissa >> remainder_bits;
-    let remainder = mantissa & ((1 << remainder_bits) - 1);
-    let rounded_quotient = match remainder.cmp(&(1 << (remainder_bits.saturating_sub(1)))) {
+    let remainder = bitselect(mantissa, 0, remainder_bits);
+    let rounded_quotient = match remainder.cmp(&(1 << remainder_bits.saturating_sub(1))) {
         Ordering::Less => quotient,
         Ordering::Equal => (quotient + 1) & !1, // Round to even
         Ordering::Greater => quotient + 1,
     };
 
     let head = rounded_quotient >> used_mantissa_bits;
-    let rounded_div_mantissa = rounded_quotient & ((1 << used_mantissa_bits) - 1);
+    let rounded_div_mantissa = bitselect(rounded_quotient, 0, used_mantissa_bits);
     (head, rounded_div_mantissa)
 }
 
@@ -540,10 +546,10 @@ fn write_hex_float<W: Write>(
         .unwrap_or(F64_MANTISSA_BITS.div_ceil(4) as usize);
 
     let bits = f64::to_bits(float);
-    let exp_bits = (bits >> F64_MANTISSA_BITS) & ((1 << F64_EXPONENT_BITS) - 1);
+    let exp_bits = bitselect(bits, F64_MANTISSA_BITS, F64_EXPONENT_BITS);
     // clamp exponent to -1022 for subnormals
-    let mut exp = (exp_bits as i16 - ((1 << (F64_EXPONENT_BITS - 1)) - 1)).max(-1022);
-    let mantissa = bits & ((1 << F64_MANTISSA_BITS) - 1);
+    let mut exp = (exp_bits as i16 + F64_EXP_OFFSET).max(-1022);
+    let mantissa = bitselect(bits, 0, F64_MANTISSA_BITS);
 
     if float == 0.0 {
         exp = 0;
@@ -600,7 +606,20 @@ fn write_hex_float<W: Write>(
     Ok(())
 }
 
-fn write_value<'gc, W: Write>(
+fn utf8_width(b: u8) -> Option<usize> {
+    match b {
+        _ if b & 0b10000000 == 0b00000000 => Some(1),
+        _ if b & 0b11100000 == 0b11000000 => Some(2),
+        _ if b & 0b11110000 == 0b11100000 => Some(3),
+        _ if b & 0b11110000 == 0b11110000 => Some(4),
+        _ => None,
+    }
+}
+fn is_utf8_trailer(b: u8) -> bool {
+    b & 0b11000000 == 0b10000000
+}
+
+fn write_escaped_value<'gc, W: Write>(
     w: &mut W,
     val: Value<'gc>,
     spec: FormatSpecifier,
@@ -608,24 +627,57 @@ fn write_value<'gc, W: Write>(
     Ok(match val {
         Value::Nil => write!(w, "nil")?,
         Value::Boolean(b) => write!(w, "{}", b)?,
-        Value::Integer(i) => write!(w, "{}", i)?,
+        Value::Integer(i) => {
+            if i == i64::MIN {
+                // MIN is not representable as positive, would be lexed as float
+                // PRLua outputs 0x8000000000000000 here, which is interpreted as
+                // a signed integer, but piccolo doesn't; instead we output a simple
+                // expression to avoid lexer issues.
+                write!(w, "({}-1)", i + 1)?
+            } else {
+                write!(w, "{}", i)?
+            }
+        }
         Value::Number(n) => {
+            if !n.is_finite() {
+                if n.is_nan() {
+                    write!(w, "(0/0)")?;
+                } else {
+                    let sign = if n.is_sign_negative() { "-" } else { "" };
+                    write!(w, "{}1e9999", sign)?
+                }
+                return Ok(());
+            }
             write_hex_float(w, n, FormatArgs::default())?;
         }
         Value::String(str) => {
-            // TODO: check string escaping
             write!(w, "\"")?;
-            for c in str.as_bytes() {
-                // TODO: handling of newlines?
-                match *c {
-                    c @ (b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~') => {
-                        write!(w, "{}", c as char)?;
+            let mut i = 0;
+            let bytes = str.as_bytes();
+            while let Some(c) = bytes.get(i).copied() {
+                match c {
+                    c @ (b' ' | b'!' | b'#'..=b'[' | b']'..=b'~') => {
+                        w.write_all(&[c])?;
                     }
                     c @ (b'\\' | b'"') => write!(w, "\\{}", c as char)?,
-                    b'\n' => write!(w, "\\n")?,
-                    b'\r' => write!(w, "\\r")?,
-                    c => write!(w, "\\x{:02}", c)?,
+                    b'\n' => write!(w, "\\\n")?,
+                    // TODO: is \r handling locale-dependent? (needs testing on windows)
+                    b'\r' => write!(w, "\\13")?,
+                    c @ 0..=127 => write!(w, "\\{}", c)?,
+                    c => {
+                        if let Some(utf8) = utf8_width(c)
+                            .and_then(|len| bytes.get(i..i + len))
+                            .filter(|b| b[1..].iter().all(|c| is_utf8_trailer(*c)))
+                        {
+                            w.write_all(utf8)?;
+                            i = i + utf8.len();
+                            continue;
+                        } else {
+                            write!(w, "\\{}", c)?;
+                        }
+                    }
                 }
+                i += 1;
             }
             write!(w, "\"")?;
         }
@@ -729,7 +781,11 @@ fn step<'gc>(
                 state.value_index += remaining_args - values_iter.as_slice().len();
 
                 match poll {
-                    EvalPoll::Done => (),
+                    EvalPoll::PassValue { value, then } => {
+                        state.inner = FormatStateInner::EvaluateCallback { spec, dest: then };
+                        stack.push_back(value);
+                        continue;
+                    }
                     EvalPoll::Call { call, then } => {
                         state.inner = FormatStateInner::EvaluateCallback { spec, dest: then };
                         let bottom = stack.len();
@@ -739,8 +795,10 @@ fn step<'gc>(
                             bottom,
                         });
                     }
+                    EvalPoll::Done => {
+                        state.inner = FormatStateInner::Start;
+                    }
                 }
-                state.inner = FormatStateInner::Start;
             }
             FormatStateInner::End => {
                 stack.replace(ctx, ctx.intern(&state.buf));
@@ -752,6 +810,10 @@ fn step<'gc>(
 
 enum EvalPoll<'gc> {
     Done,
+    PassValue {
+        value: Value<'gc>,
+        then: EvalContinuation,
+    },
     Call {
         call: meta_ops::MetaCall<'gc, 1>,
         then: EvalContinuation,
@@ -822,25 +884,18 @@ fn evaluate_specifier<'gc, W: Write>(
             let args = spec.common_args(values)?;
 
             let val = spec.next_value(values)?;
-            let val = match meta_ops::tostring(ctx, val)? {
-                MetaResult::Value(val) => val,
-                MetaResult::Call(call) => {
-                    return Ok(EvalPoll::Call {
-                        call,
-                        then: EvalContinuation::ToStringResult(args),
-                    });
-                }
+            let poll = match meta_ops::tostring(ctx, val)? {
+                MetaResult::Value(value) => EvalPoll::PassValue {
+                    value,
+                    then: EvalContinuation::ToStringResult(args),
+                },
+                MetaResult::Call(call) => EvalPoll::Call {
+                    call,
+                    then: EvalContinuation::ToStringResult(args),
+                },
             };
-            let string = val
-                .into_string(ctx)
-                .ok_or_else(|| FormatError::BadValueType(spec.spec, "string", val.type_name()))?;
-
-            let len = string.len() as usize;
-            let truncated_len = args.precision.unwrap_or(len).min(len);
-
-            let pad = args.pad_num_before(w, truncated_len, 0, b"")?;
-            w.write_all(&string[..truncated_len])?;
-            pad.finish_pad(w)?;
+            // Continue in `evaluate_continuation`
+            return Ok(poll);
         }
         b'd' | b'i' => {
             // signed int
@@ -972,7 +1027,7 @@ fn evaluate_specifier<'gc, W: Write>(
             // Lua escape
             spec.check_flags(Flags::NONE)?;
             let val = spec.next_value(values)?;
-            write_value(w, val, spec)?;
+            write_escaped_value(w, val, spec)?;
         }
         c => return Err(FormatError::BadSpec(c).into()),
     }
@@ -980,9 +1035,7 @@ fn evaluate_specifier<'gc, W: Write>(
 }
 
 mod parse {
-    use std::num::ParseIntError;
-
-    use super::{Flags, FormatError, FormatSpecifier, OptionalArg, FMT_SPEC};
+    use super::{Flags, FormatError, FormatSpecifier, OptionalArg, ARG_MAX, FMT_SPEC};
 
     struct PeekableIter<'a> {
         base: &'a [u8],
@@ -995,10 +1048,8 @@ mod parse {
         fn peek(&mut self) -> Option<u8> {
             self.cur.get(0).copied()
         }
-        fn next(&mut self) -> Option<u8> {
-            let v = self.cur.get(0).copied();
+        fn advance(&mut self) {
             self.cur = &self.cur[1..];
-            v
         }
         fn cur_index(&self) -> usize {
             self.base.len() - self.cur.len()
@@ -1015,11 +1066,11 @@ mod parse {
         #[rustfmt::skip]
         let _ = loop {
             match iter.peek() {
-                Some(b'#') => { iter.next(); flags |= Flags::ALTERNATE; },
-                Some(b'-') => { iter.next(); flags |= Flags::LEFT_ALIGN; },
-                Some(b'+') => { iter.next(); flags |= Flags::SIGN_FORCE; },
-                Some(b' ') => { iter.next(); flags |= Flags::SIGN_SPACE; },
-                Some(b'0') => { iter.next(); flags |= Flags::ZERO_PAD; },
+                Some(b'#') => { iter.advance(); flags |= Flags::ALTERNATE; },
+                Some(b'-') => { iter.advance(); flags |= Flags::LEFT_ALIGN; },
+                Some(b'+') => { iter.advance(); flags |= Flags::SIGN_FORCE; },
+                Some(b' ') => { iter.advance(); flags |= Flags::SIGN_SPACE; },
+                Some(b'0') => { iter.advance(); flags |= Flags::ZERO_PAD; },
                 _ => break,
             }
         };
@@ -1030,7 +1081,7 @@ mod parse {
         }
 
         let precision = if let Some(b'.') = iter.peek() {
-            iter.next();
+            iter.advance();
             flags |= Flags::PRECISION;
             let arg = try_parse_optional_arg(&mut iter).map_err(|_| FormatError::BadPrecision)?;
             match arg {
@@ -1041,7 +1092,8 @@ mod parse {
             OptionalArg::None
         };
 
-        let spec = iter.next().ok_or_else(|| FormatError::BadSpec(FMT_SPEC))?;
+        let spec = iter.peek().ok_or_else(|| FormatError::BadSpec(FMT_SPEC))?;
+        iter.advance();
         let spec_end = next + 1 + iter.cur_index();
 
         Ok((
@@ -1055,10 +1107,10 @@ mod parse {
         ))
     }
 
-    fn try_parse_optional_arg(iter: &mut PeekableIter<'_>) -> Result<OptionalArg, ParseIntError> {
+    fn try_parse_optional_arg(iter: &mut PeekableIter<'_>) -> Result<OptionalArg, ()> {
         match iter.peek() {
             Some(b'*') => {
-                iter.next();
+                iter.advance();
                 Ok(OptionalArg::Arg)
             }
             Some(b'0'..=b'9') => {
@@ -1072,8 +1124,10 @@ mod parse {
                 // of ASCII characters between 0 and 9.
                 let slice = unsafe { std::str::from_utf8_unchecked(&iter.cur[..len]) };
 
-                let num = slice.parse::<u8>()?;
-
+                let num = slice.parse::<u32>().map_err(drop)?;
+                if num > ARG_MAX {
+                    return Err(());
+                }
                 iter.cur = &iter.cur[len..];
                 Ok(OptionalArg::Specified(num))
             }

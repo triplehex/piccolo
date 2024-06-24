@@ -231,6 +231,7 @@ end
 do
     assert_eq(string.format("%a", 0x1.fffffffffffffp+0), "0x1.fffffffffffffp+0")
     assert_eq(string.format("%.7a", 0x1.fffffffffffffp+0), "0x2.0000000p+0")
+    assert_eq(string.format("%.7a", 0x1.88fffffffffffp+0), "0x1.8900000p+0")
 
     local smallest_normal = 0x1p-1022
     local largest_subnormal = 0x0.fffffffffffffp-1022
@@ -258,4 +259,29 @@ do
 
     -- test fixed precision
     assert_eq(string.format("%.13a %g", smallest_normal, smallest_normal), "0x1.0000000000000p-1022 2.22507e-308")
+end
+
+do
+    local s = ""
+    -- table.concat would be nice here...
+    for i = 1, 127 do
+        s = s .. string.format("%c", i)
+    end
+    s = string.format("%q", s)
+    assert_eq(s, [["\1\2\3\4\5\6\7\8\9\
+\11\12\13\14\15\16\17\18\19\20\21\22\23\24\25\26\27\28\29\30\31 !\"]]..
+[[#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`ab]]..
+[[cdefghijklmnopqrstuvwxyz{|}~\127"]])
+end
+
+do
+    assert_eq(string.format("%q", (0.0/0)), "(0/0)")
+    assert_eq(string.format("%q", (1.0/0)), "1e9999")
+    assert_eq(string.format("%q", -(0.0/0)), "(0/0)")
+    assert_eq(string.format("%q", -(1.0/0)), "-1e9999")
+    assert_eq(string.format("%q %q", 1.0, math.pi), "0x1p+0 0x1.921fb54442d18p+1")
+
+    -- TODO: impl load, make sure values round-trip
+    -- assert_eq(string.format("%q", math.mininteger), "0x8000000000000000")
+    -- assert_eq(string.format("%q", math.mininteger), "(-9223372036854775807-1)")
 end
