@@ -129,22 +129,6 @@ do -- string width, truncating
     assert_eq(string.format("%8e", 1000000), "1.000000e+06")
     assert_eq(string.format("%8E", 1000000), "1.000000E+06")
 
-    -- dprint(string.format("%08g", 1))
-    -- dprint(string.format("%08g", 1.500001))
-    -- dprint(string.format("%08g", 1.50001))
-    -- dprint(string.format("%08.1g", 1.5))
-    -- dprint(string.format("%08g", 1000))
-    -- dprint(string.format("%08g", 100000))
-    -- dprint(string.format("%08g", 1000000))
-
-    -- dprint(string.format("%-08g", 1))
-    -- dprint(string.format("%-08g", 1.500001))
-    -- dprint(string.format("%-08g", 1.50001))
-    -- dprint(string.format("%-08.1g", 1.5))
-    -- dprint(string.format("%-08g", 1000))
-    -- dprint(string.format("%-08g", 100000))
-    -- dprint(string.format("%-08g", 1000000))
-
     assert_eq(string.format("%g", 0/0), "-nan")
     assert_eq(string.format("%g", math.abs(0/0)), "nan")
     assert_eq(string.format("%g", 1/0), "inf")

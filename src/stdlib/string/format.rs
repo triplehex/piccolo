@@ -1,3 +1,71 @@
+//! An implementation of C's `sprintf` / Lua's `string.format`
+//!
+//! References:
+//! - [Lua 5.4 Manual on `string.format`](https://www.lua.org/manual/5.4/manual.html#pdf-string.format)
+//! - [glibc manual 12.12: Formatted Output](https://www.gnu.org/software/libc/manual/html_node/Formatted-Output.html)
+//! - [Documentation of specific meaning of `%g`](https://stackoverflow.com/a/54162153)
+//! - [Python's formatting docs](https://docs.python.org/3/library/string.html#format-specification-mini-language)
+//!
+//! Specifier syntax: `"%" [flags] [width] ["." precision] spec`
+//!
+//! Supported specifiers:
+//! - `%%`
+//! - `%c` - print byte (mod 256)
+//! - `%s` - print string (prints raw bytes, does not reinterpret as utf8)
+//! - `%d`, `%i` - print signed integer
+//! - `%u` - print unsigned int (cast to 64 bit signed integer, then interpreted as unsigned)
+//! - `%o` - usigned octal int
+//! - `%x`, `%X` - unsigned hex int
+//! - `%b`, `%B` - unsigned binary int
+//! - `%g`, `%G` - compact floating point
+//! - `%f`, `%F` - normal form floating point
+//! - `%e`, `%E` - exponential form floating point
+//! - `%a`, `%A` - hexidecimal floating point
+//! - `%p` - print a lua value as a pointer, for non-literal values
+//! - `%q` - print escaped lua literal; nil, bool, string, integer, or float (formatted as a hex float)
+//!
+//! Potential future additions
+//! - `%C` - print unicode character as utf8
+//! - `%S` - unicode-aware alias of `%s`
+//!
+//! Supported flags:
+//! - `-`: left align
+//! - `0`: zero pad
+//! - ` ` (space): include space in sign position for positive numbers
+//! - `+`: include sign for positive numbers, overriding space if both are specified
+//! - `#`: alternate mode
+//!     - On floats, preserve a trailing decimal point
+//!     - On hex/octal/binary integers, prefix with the format
+//!       (`0x`, `0`, and `0b`, respectively)
+//!
+//! Width and precision are supported, but are limited to 255.
+//! - Width: specify the minimum width to pad to
+//!     - Ignored on `%q`
+//! - Precision:
+//!     - For `%s`, truncates the string to the specified length
+//!     - For integer specs, zero-pad the number to the specified length
+//!       (may differ from `width`, which is still padded with spaces)
+//!     - For floats, specify the number of digits of precision to use
+//! - This implementation supports using `*` to read width/precision
+//!   from the argument list. The argument is converted to an integer;
+//!   for `width`, if the argument is negative, the value will be left
+//!   aligned, and use `abs(arg)` as the width.
+//!
+//! Compatability notes:
+//! - Should match output of PRLua's `string.format` / POSIX sprintf
+//!   in the vast majority of cases, but there will be differences.
+//! - PRLua limits width and precision specifiers to 99, whereas this
+//!   limits them to 255.
+//! - (Matching PRLua) No support for C style value length specifiers.
+//! - (Matching PRLua) No support for `%n` (length write-back)
+//! - Floating point formatting may differ slightly:
+//!     - `%f` specifier does not support `#` to require trailing decimal,
+//!        due to implementation limitations
+//!     - formatting of subnormal numbers has not been thoroughly tested,
+//!       may have rounding errors.
+//! - PRLua does not support `%F` (uppercase float; only differs in inf/nan case)
+//! - PRLua does not support the C23 `%b`/`%B` (binary unsigned int) specifiers
+
 use std::{
     char,
     cmp::Ordering,
@@ -32,28 +100,6 @@ enum FormatError {
     #[error("weird floating point value?")]
     BadFloat,
 }
-
-/// Implementation of printf
-///
-/// Supported flags:
-/// - `#`: alternate mode
-/// - `-`: left align
-/// - `0`: zero pad
-/// - `+`: include sign
-/// - ` `: include space in sign position for positive numbers
-///
-/// Unsupported flags:
-/// - `'`: digit group separator
-///
-/// Width and precision are supported, but are limited to 255.
-///
-/// Unsupported conversions:
-/// - `%n` (sadly, no turing complete printf)
-/// - `%b`, `%B` (booleans)
-/// - value length (`hh`, `h`, `l`, `ll`, `L`, etc)
-///
-/// Additional conversions:
-/// - `%q` - print an escaped Lua literal value (escapes strings, prints floats as hex)
 
 const FMT_SPEC: u8 = b'%';
 
