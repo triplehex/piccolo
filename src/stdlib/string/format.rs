@@ -54,10 +54,6 @@
 //! Compatability notes:
 //! - Should match output of PRLua's `string.format` / POSIX sprintf
 //!   in the vast majority of cases, but there will be differences.
-//! - PRLua limits width and precision specifiers to 99, whereas this
-//!   limits them to 255.
-//! - (Matching PRLua) No support for C style value length specifiers.
-//! - (Matching PRLua) No support for `%n` (length write-back)
 //! - Floating point formatting may differ slightly:
 //!     - `%f` specifier does not support `#` to require trailing decimal,
 //!        due to implementation limitations
@@ -70,6 +66,8 @@
 //! - PRLua's `%q` passes any byte above 127 through as a raw byte; this
 //!   implementation passes through valid UTF-8 codepoints, but escapes
 //!   other bytes.
+//! - (Matching PRLua) No support for C style value length specifiers.
+//! - (Matching PRLua) No support for `%n` (length write-back)
 
 use std::{
     char,
