@@ -11,12 +11,12 @@ local function assert_eq(val, exp)
 end
 
 
-assert_eq(string.format("abc%sdef", "iii"), "abciiidef")
-
-assert_eq(string.format("%s__", 123), "123__")
-assert_eq(string.format("__%s", 321), "__321")
-
 do
+    assert_eq(string.format("abc%sdef", "iii"), "abciiidef")
+
+    assert_eq(string.format("%s__", 123), "123__")
+    assert_eq(string.format("__%s", 321), "__321")
+
     assert_eq(string.format("%d %d %d", 1, 2, 3), "1 2 3")
 end
 
@@ -26,10 +26,6 @@ do -- string width, truncating
     assert_eq(string.format("%5s", "a"), "    a")
     assert_eq(string.format("%-5s", "a"), "a    ")
     assert_eq(string.format("%-s", "example"), "example")
-
-    -- assert_eq(string.format("%*s", 3, "a"), "  a")
-    -- assert_eq(string.format("%-*s", 3, "a"), "a  ")
-    -- assert_eq(string.format("%*s", -3, "a"), "a  ")
 
     assert_eq(string.format("%.3s", "example"), "exa")
     assert_eq(string.format("%.s", "example"), "")
@@ -156,7 +152,7 @@ do -- string width, truncating
     assert_eq(string.format("'%-+8.3f'", 15.1234), "'+15.123 '")
     assert_eq(string.format("'%0+8.3f'", 15.1234), "'+015.123'")
 
-    -- assert_eq(string.format("'%#.0f'", 1), "'1.'") -- Can't fix this, relying on rust's std
+    -- assert_eq(string.format("'%#.0f'", 1), "'1.'") -- Can't easily fix this, relying on rust's std
     assert_eq(string.format("'%.0f'", 1), "'1'")
     assert_eq(string.format("'%g'", 1), "'1'")
     assert_eq(string.format("'%#g'", 1), "'1.00000'")
@@ -220,8 +216,7 @@ do -- string width, truncating
 end
 
 do
-
-    -- assert_eq(string.format("%q", "asdf\nabc\"def"), "\"asdf\\nabc\\\"def\"")
+    assert_eq(string.format("%q", "asdf\nabc\"def"), "\"asdf\\\nabc\\\"def\"")
 
     assert_eq(string.format("%q", 15.345678), "0x1.eb0fcb4f1e4b4p+3")
 
@@ -291,9 +286,12 @@ do
     -- assert_eq(string.format("%q", math.mininteger), "(-9223372036854775807-1)")
 end
 
--- TODO: would be nice to have runtime detection, to disable this when
--- running PRLua
-if false then
+-- Piccolo-specific tests
+if piccolo then
+    assert_eq(string.format("%*s", 3, "a"), "  a")
+    assert_eq(string.format("%-*s", 3, "a"), "a  ")
+    assert_eq(string.format("%*s", -3, "a"), "a  ")
+
     assert_eq(string.format("%.2S", "aa😀bb"), "aa")
     assert_eq(string.format("%.3S", "aa😀bb"), "aa😀")
     assert_eq(string.format("%S", "aa😀bb"), "aa😀bb")
