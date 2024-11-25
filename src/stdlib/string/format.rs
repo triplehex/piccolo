@@ -73,20 +73,20 @@
 //! - Supports `%S`, a unicode-aware variant of `%s`; width and precision
 //!   are specified in terms of codepoints rather than bytes.
 
-use std::{
-    char,
-    cmp::Ordering,
-    io::{Cursor, Write},
-    pin::Pin,
-};
+use core::{char, pin::Pin};
+use std::io::Write;
 
+use float::FloatMode;
 use gc_arena::{Collect, Gc};
 use thiserror::Error;
 
 use crate::{
     meta_ops::{self, MetaResult},
-    Context, Error, FromValue, Function, Sequence, SequencePoll, Value,
+    Context, Error, Execution, FromValue, Function, Sequence, SequencePoll, Stack, Value,
 };
+
+const FMT_SPEC: u8 = b'%';
+const ARG_MAX: u32 = 99;
 
 #[derive(Debug, Error)]
 enum FormatError {
@@ -110,12 +110,10 @@ enum FormatError {
     NonUnicodeString(u8),
 }
 
-const FMT_SPEC: u8 = b'%';
-const ARG_MAX: u32 = 99;
-
 // TODO: useful Debug impl for flags for errors?
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Flags(u8);
+
 impl Flags {
     const NONE: Self = Self(0);
     const ALL: Self = Self(u8::MAX);
@@ -131,18 +129,21 @@ impl Flags {
     const WIDTH: Self = Self(1 << 5);
     const PRECISION: Self = Self(1 << 6);
 }
+
 impl Flags {
     fn has(self, flag: Flags) -> bool {
         self.0 & flag.0 == flag.0
     }
 }
-impl std::ops::BitOr for Flags {
+
+impl core::ops::BitOr for Flags {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
 }
-impl std::ops::BitOrAssign for Flags {
+
+impl core::ops::BitOrAssign for Flags {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
@@ -157,12 +158,14 @@ struct FormatSpecifier {
     width: OptionalArg,
     precision: OptionalArg,
 }
+
 #[derive(Copy, Clone)]
 enum OptionalArg {
     None,
     Arg,
     Specified(u32),
 }
+
 #[derive(Default, Clone, Copy)]
 struct FormatArgs {
     width: usize,
@@ -182,6 +185,7 @@ impl FormatSpecifier {
             Ok(())
         }
     }
+
     fn get_arg<'gc>(
         &self,
         arg: OptionalArg,
@@ -201,21 +205,20 @@ impl FormatSpecifier {
             OptionalArg::Specified(val) => Ok((Some(val as usize), false)),
         }
     }
+
     fn common_args<'gc>(
         &self,
         values: &mut impl Iterator<Item = Value<'gc>>,
     ) -> Result<FormatArgs, FormatError> {
         let (width, width_neg) = self.get_arg(self.width, values)?;
         let (precision, _) = self.get_arg(self.precision, values)?;
-        let left_align = self.flags.has(Flags::LEFT_ALIGN) || width_neg;
-        let zero_pad = self.flags.has(Flags::ZERO_PAD) && !left_align;
-        let alternate = self.flags.has(Flags::ALTERNATE);
         Ok(FormatArgs {
             width: width.unwrap_or(0),
             precision,
-            left_align,
-            zero_pad,
-            alternate,
+            left_align: self.flags.has(Flags::LEFT_ALIGN) || width_neg,
+            zero_pad: self.flags.has(Flags::ZERO_PAD)
+                && !(self.flags.has(Flags::LEFT_ALIGN) || width_neg),
+            alternate: self.flags.has(Flags::ALTERNATE),
             upper: self.spec.is_ascii_uppercase(),
             flags: self.flags,
         })
@@ -225,10 +228,9 @@ impl FormatSpecifier {
         &self,
         values: &mut impl Iterator<Item = Value<'gc>>,
     ) -> Result<Value<'gc>, FormatError> {
-        values
-            .next()
-            .ok_or_else(|| FormatError::MissingValue(self.spec))
+        values.next().ok_or(FormatError::MissingValue(self.spec))
     }
+
     fn next_int<'gc>(
         &self,
         values: &mut impl Iterator<Item = Value<'gc>>,
@@ -239,6 +241,7 @@ impl FormatSpecifier {
             .ok_or_else(|| FormatError::BadValueType(self.spec, "integer", val.type_name()))?;
         Ok(int)
     }
+
     fn next_float<'gc>(
         &self,
         values: &mut impl Iterator<Item = Value<'gc>>,
@@ -263,6 +266,7 @@ impl FormatArgs {
             b""
         }
     }
+
     fn integer_zeroed_width(&self, prefix: &[u8]) -> usize {
         if let Some(p) = self.precision {
             p
@@ -272,6 +276,7 @@ impl FormatArgs {
             0
         }
     }
+
     fn pad_num_before<W: Write>(
         &self,
         w: &mut W,
@@ -292,9 +297,8 @@ impl FormatArgs {
         if zero_padding > 0 {
             write_padding(w, b'0', zero_padding)?;
         }
-        Ok(PadScope {
-            trailing_padding: if self.left_align { space_padding } else { 0 },
-        })
+        let trailing_padding = if self.left_align { space_padding } else { 0 };
+        Ok(PadScope { trailing_padding })
     }
 }
 
@@ -302,6 +306,7 @@ impl FormatArgs {
 struct PadScope {
     trailing_padding: usize,
 }
+
 impl PadScope {
     fn finish_pad<W: Write>(self, w: &mut W) -> Result<(), std::io::Error> {
         if self.trailing_padding > 0 {
@@ -328,20 +333,61 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
-fn format_into_buffer<'a>(
-    buf: &'a mut [u8],
-    args: std::fmt::Arguments<'_>,
-) -> Result<&'a str, std::io::Error> {
-    let mut buf = Cursor::new(buf);
-    write!(&mut buf, "{}", args)?;
-    let len = buf.position() as usize;
-    let slice = &buf.into_inner()[..len];
-
-    // Safety: write! can only output valid utf8.
-    let str = unsafe { std::str::from_utf8_unchecked(slice) };
-    Ok(str)
+fn utf8_width(b: u8) -> Option<usize> {
+    match b {
+        _ if b & 0b1000_0000 == 0b0000_0000 => Some(1),
+        _ if b & 0b1110_0000 == 0b1100_0000 => Some(2),
+        _ if b & 0b1111_0000 == 0b1110_0000 => Some(3),
+        _ if b & 0b1111_1000 == 0b1111_0000 => Some(4),
+        _ => None,
+    }
 }
 
+fn is_utf8_trailer(b: u8) -> bool {
+    b & 0b1100_0000 == 0b1000_0000
+}
+
+fn format_into_buffer<'a>(
+    buf: &'a mut [u8],
+    args: core::fmt::Arguments<'_>,
+) -> Result<&'a str, core::fmt::Error> {
+    use core::fmt::Write;
+
+    struct BufferWriter<'a> {
+        buffer: &'a mut [u8],
+        offset: usize,
+    }
+
+    impl<'a> BufferWriter<'a> {
+        fn new(buffer: &'a mut [u8]) -> Self {
+            Self { buffer, offset: 0 }
+        }
+        fn into_str(self) -> &'a str {
+            let slice = &self.buffer[..self.offset];
+            // Safety: `buffer` can only be filled by write_str,
+            // which requires valid utf8 strings.
+            unsafe { core::str::from_utf8_unchecked(slice) }
+        }
+    }
+
+    impl Write for BufferWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let dest = self.buffer[self.offset..]
+                .get_mut(..bytes.len())
+                .ok_or(core::fmt::Error)?;
+            dest.copy_from_slice(bytes);
+            self.offset += bytes.len();
+            Ok(())
+        }
+    }
+
+    let mut writer = BufferWriter::new(buf);
+    write!(writer, "{}", args)?;
+    Ok(writer.into_str())
+}
+
+// write_all, but for a single byte repeated `count` times.
 fn write_padding<W>(w: &mut W, byte: u8, count: usize) -> Result<(), std::io::Error>
 where
     W: Write,
@@ -358,272 +404,19 @@ where
     Ok(())
 }
 
+// Remove trailing zeroes from a formatted number without changing its value.
 fn strip_nonsignificant_zeroes(str: &str) -> &str {
-    if let Some(last_nonzero) = str.bytes().rposition(|p| p != b'0') {
-        if let Some(decimal) = str[..last_nonzero + 1].rfind('.') {
+    if let Some(last_nonzero) = str.rfind(|p| p != '0') {
+        if let Some(decimal) = str[..=last_nonzero].rfind('.') {
+            // If the number ends with a trailing decimal point, remove it.
             if decimal == last_nonzero {
                 return &str[..last_nonzero];
             } else {
-                return &str[..last_nonzero + 1];
+                return &str[..=last_nonzero];
             }
         }
     }
     str
-}
-
-enum FloatMode {
-    Normal,
-    Exponent,
-    Compact,
-    Hex,
-}
-
-fn write_nonfinite_float<W: Write>(
-    w: &mut W,
-    float: f64,
-    args: FormatArgs,
-    sign: &[u8],
-) -> Result<(), std::io::Error> {
-    let s = match (float.is_infinite(), args.upper) {
-        (true, false) => "inf",
-        (true, true) => "INF",
-        (false, false) => "nan",
-        (false, true) => "NAN",
-    };
-    let pad = args.pad_num_before(w, s.len(), 0, sign)?;
-    write!(w, "{s}")?;
-    pad.finish_pad(w)?;
-    return Ok(());
-}
-
-fn write_float<'gc, W: Write>(
-    w: &mut W,
-    float: f64,
-    mode: FloatMode,
-    args: FormatArgs,
-    float_buf: &mut [u8],
-) -> Result<(), Error<'gc>> {
-    let sign = args.sign_char(float.is_sign_negative());
-
-    let preserve_decimal = args.alternate;
-    let width = args.width;
-    let precision = args.precision.unwrap_or(6);
-
-    if !float.is_finite() {
-        return write_nonfinite_float(w, float, args, sign).map_err(Into::into);
-    }
-
-    if matches!(mode, FloatMode::Hex) {
-        return write_hex_float(w, float, args).map_err(Into::into);
-    }
-
-    if matches!(mode, FloatMode::Compact | FloatMode::Exponent) {
-        let p = if matches!(mode, FloatMode::Compact) {
-            precision.saturating_sub(1)
-        } else {
-            precision
-        };
-        let str = format_into_buffer(&mut *float_buf, format_args!("{:+.p$e}", float))?;
-
-        let idx = str.rfind('e').ok_or(FormatError::BadFloat)?;
-        let exp = str[idx + 1..]
-            .parse::<i16>()
-            .map_err(|_| FormatError::BadFloat)?;
-
-        // Note: Rust does not include a leading '+' in the exponent notation, but Lua does,
-        // so we must calculate the length manually.
-        let exp_len = 1 + integer_length(exp.unsigned_abs() as u64);
-
-        // Implementation of %g, following the description of the algorithm
-        // in Python's documentation:
-        // https://docs.python.org/3/library/string.html#format-specification-mini-language
-        if matches!(mode, FloatMode::Compact) && exp >= -4 && (exp as i64) < precision as i64 {
-            let p = (precision as i64 - 1 - exp as i64) as usize;
-
-            let str;
-            if preserve_decimal {
-                // Add a decimal at the end, in case Rust doesn't generate one; then strip it out
-                let s = format_into_buffer(&mut *float_buf, format_args!("{:+.p$}.", float))?;
-                if s[1..s.len() - 1].contains('.') {
-                    str = &s[1..s.len() - 1];
-                } else {
-                    str = &s[1..];
-                }
-            } else {
-                let s = format_into_buffer(&mut *float_buf, format_args!("{:+.p$}", float))?;
-                str = strip_nonsignificant_zeroes(&s[1..]);
-            }
-
-            let len = str.len();
-            let zero_width = if args.zero_pad { width } else { 0 };
-
-            let pad = args.pad_num_before(w, len, zero_width, sign)?;
-            write!(w, "{}", str)?;
-            pad.finish_pad(w)?;
-        } else {
-            // [   ][-][000][a.bbb][e][+EE]
-            let mut mantissa = &str[1..idx];
-            if matches!(mode, FloatMode::Compact) && !preserve_decimal {
-                mantissa = strip_nonsignificant_zeroes(mantissa);
-            }
-            let e = if args.upper { 'E' } else { 'e' };
-
-            let exp_len = exp_len.max(3);
-            let len = mantissa.len() + 1 + exp_len;
-            let zero_width = if args.zero_pad { width } else { 0 };
-
-            let fallback_dec = preserve_decimal && !str.contains('.');
-
-            if !fallback_dec {
-                let pad = args.pad_num_before(w, len, zero_width, sign)?;
-                write!(w, "{mantissa}{e}{exp:+03}")?;
-                pad.finish_pad(w)?;
-            } else {
-                let pad = args.pad_num_before(w, len + 1, zero_width, sign)?;
-                write!(w, "{mantissa}.{e}{exp:+03}")?;
-                pad.finish_pad(w)?;
-            }
-        }
-    } else {
-        // normal float
-        // This can be larger than any reasonable buffer, so we have
-        // to forward everything to std
-
-        // TODO: cannot support the '#' preserving decimal mode
-        // string.format("'%#.0f'", 1) should result in "1."
-        match (args.left_align, args.zero_pad, sign) {
-            (false, false, b"" | b"-") => write!(w, "{float:width$.precision$}")?,
-            (false, true, b"" | b"-") => write!(w, "{float:>0width$.precision$}")?,
-            (false, false, b"+") => write!(w, "{float:+width$.precision$}")?,
-            (false, true, b"+") => write!(w, "{float:>+0width$.precision$}")?,
-            (false, false, b" ") => write!(w, " {float:width$.precision$}")?,
-            (false, true, b" ") => write!(w, " {float:>0width$.precision$}")?,
-            (true, _, b"" | b"-") => write!(w, "{float:<width$.precision$}")?,
-            (true, _, b"+") => write!(w, "{float:<+width$.precision$}")?,
-            (true, _, b" ") => write!(w, " {float:<width$.precision$}")?,
-            _ => unreachable!(),
-        }
-    }
-    Ok(())
-}
-
-const F64_EXPONENT_BITS: u32 = 11;
-const F64_MANTISSA_BITS: u32 = 52;
-const F64_EXP_OFFSET: i16 = -(1 << (F64_EXPONENT_BITS - 1)) + 1;
-
-#[inline]
-const fn bitselect(n: u64, off: u32, count: u32) -> u64 {
-    (n >> off) & ((1 << count) - 1)
-}
-
-fn round_mantissa(mantissa: u64, exp_bits: u16, precision: usize) -> (u64, u64) {
-    let leading_bit = (exp_bits != 0) as u64;
-    let mantissa = mantissa | (leading_bit << F64_MANTISSA_BITS);
-    let used_mantissa_bits = (precision as u32 * 4).min(F64_MANTISSA_BITS);
-
-    let remainder_bits = F64_MANTISSA_BITS - used_mantissa_bits as u32;
-    let quotient = mantissa >> remainder_bits;
-    let remainder = bitselect(mantissa, 0, remainder_bits);
-    let rounded_quotient = match remainder.cmp(&(1 << remainder_bits.saturating_sub(1))) {
-        Ordering::Less => quotient,
-        Ordering::Equal => (quotient + 1) & !1, // Round to even
-        Ordering::Greater => quotient + 1,
-    };
-
-    let head = rounded_quotient >> used_mantissa_bits;
-    let rounded_div_mantissa = bitselect(rounded_quotient, 0, used_mantissa_bits);
-    (head, rounded_div_mantissa)
-}
-
-fn write_hex_float<W: Write>(
-    w: &mut W,
-    float: f64,
-    args: FormatArgs,
-) -> Result<(), std::io::Error> {
-    let sign = args.sign_char(float.is_sign_negative());
-    let preserve_decimal = args.alternate;
-
-    if !float.is_finite() {
-        return write_nonfinite_float(w, float, args, sign);
-    }
-
-    let width = args.width;
-    let mut precision = args
-        .precision
-        .unwrap_or(F64_MANTISSA_BITS.div_ceil(4) as usize);
-
-    let bits = f64::to_bits(float);
-    let exp_bits = bitselect(bits, F64_MANTISSA_BITS, F64_EXPONENT_BITS);
-    // clamp exponent to -1022 for subnormals
-    let mut exp = (exp_bits as i16 + F64_EXP_OFFSET).max(-1022);
-    let mantissa = bitselect(bits, 0, F64_MANTISSA_BITS);
-
-    if float == 0.0 {
-        exp = 0;
-    }
-
-    let (head, mut mantissa) = round_mantissa(mantissa, exp_bits as u16, precision);
-
-    let prefix: &[u8] = match (sign, args.upper) {
-        (b"", false) => b"0x",
-        (b"-", false) => b"-0x",
-        (b"+", false) => b"+0x",
-        (b" ", false) => b" 0x",
-        (b"", true) => b"0X",
-        (b"-", true) => b"-0X",
-        (b"+", true) => b"+0X",
-        (b" ", true) => b" 0X",
-        _ => unreachable!(),
-    };
-    let zero_width = if args.zero_pad {
-        width.saturating_sub(prefix.len())
-    } else {
-        0
-    };
-
-    if args.precision.is_none() {
-        let trailing_zero_digits = mantissa.trailing_zeros().min(F64_MANTISSA_BITS) / 4;
-        mantissa = mantissa >> (trailing_zero_digits * 4);
-        precision = precision.saturating_sub(trailing_zero_digits as usize);
-    }
-
-    if precision != 0 {
-        let m_width = precision;
-        let len = 2 + m_width + 1 + 1 + integer_length(exp.unsigned_abs() as u64);
-
-        let pad = args.pad_num_before(w, len, zero_width, prefix)?;
-        if args.upper {
-            write!(w, "{head}.{mantissa:0m_width$X}P{exp:+}")?;
-        } else {
-            write!(w, "{head}.{mantissa:0m_width$x}p{exp:+}")?;
-        }
-        pad.finish_pad(w)?;
-    } else {
-        let len = 3 + preserve_decimal as usize + integer_length(exp.unsigned_abs() as u64);
-
-        let p = if args.upper { 'P' } else { 'p' };
-        let pad = args.pad_num_before(w, len, zero_width, prefix)?;
-        if preserve_decimal {
-            write!(w, "{head}.{p}{exp:+}")?;
-        } else {
-            write!(w, "{head}{p}{exp:+}")?;
-        }
-        pad.finish_pad(w)?;
-    }
-    Ok(())
-}
-
-fn utf8_width(b: u8) -> Option<usize> {
-    match b {
-        _ if b & 0b10000000 == 0b00000000 => Some(1),
-        _ if b & 0b11100000 == 0b11000000 => Some(2),
-        _ if b & 0b11110000 == 0b11100000 => Some(3),
-        _ if b & 0b11110000 == 0b11110000 => Some(4),
-        _ => None,
-    }
-}
-fn is_utf8_trailer(b: u8) -> bool {
-    b & 0b11000000 == 0b10000000
 }
 
 fn write_escaped_value<'gc, W: Write>(
@@ -631,31 +424,38 @@ fn write_escaped_value<'gc, W: Write>(
     val: Value<'gc>,
     spec: FormatSpecifier,
 ) -> Result<(), Error<'gc>> {
-    Ok(match val {
-        Value::Nil => write!(w, "nil")?,
-        Value::Boolean(b) => write!(w, "{}", b)?,
+    match val {
+        Value::Nil => {
+            write!(w, "nil")?;
+            Ok(())
+        }
+        Value::Boolean(b) => {
+            write!(w, "{}", b)?;
+            Ok(())
+        }
         Value::Integer(i) => {
             if i == i64::MIN {
                 // MIN is not representable as positive, would be lexed as float
                 // PRLua outputs 0x8000000000000000 here, which is interpreted as
                 // a signed integer, but piccolo doesn't; instead we output a simple
                 // expression to avoid lexer issues.
-                write!(w, "({}-1)", i + 1)?
+                write!(w, "({}-1)", i + 1)?;
             } else {
-                write!(w, "{}", i)?
+                write!(w, "{}", i)?;
             }
+            Ok(())
         }
         Value::Number(n) => {
-            if !n.is_finite() {
-                if n.is_nan() {
-                    write!(w, "(0/0)")?;
-                } else {
-                    let sign = if n.is_sign_negative() { "-" } else { "" };
-                    write!(w, "{}1e9999", sign)?
-                }
-                return Ok(());
+            if n.is_finite() {
+                float::write_hex_float(w, n, FormatArgs::default())?;
+            } else if n.is_nan() {
+                write!(w, "(0/0)")?;
+            } else {
+                // +/- infinity
+                let sign = if n.is_sign_negative() { "-" } else { "" };
+                write!(w, "{}1e9999", sign)?;
             }
-            write_hex_float(w, n, FormatArgs::default())?;
+            Ok(())
         }
         Value::String(str) => {
             write!(w, "\"")?;
@@ -677,7 +477,7 @@ fn write_escaped_value<'gc, W: Write>(
                             .filter(|b| b[1..].iter().all(|c| is_utf8_trailer(*c)))
                         {
                             w.write_all(utf8)?;
-                            i = i + utf8.len();
+                            i += utf8.len();
                             continue;
                         } else {
                             write!(w, "\\{}", c)?;
@@ -687,16 +487,15 @@ fn write_escaped_value<'gc, W: Write>(
                 i += 1;
             }
             write!(w, "\"")?;
+            Ok(())
         }
-        _ => {
-            return Err(FormatError::BadValueType(spec.spec, "constant", val.type_name()).into());
-        }
-    })
+        _ => Err(FormatError::BadValueType(spec.spec, "constant", val.type_name()).into()),
+    }
 }
 
 pub fn string_format<'gc>(
     ctx: Context<'gc>,
-    stack: crate::Stack<'gc, '_>,
+    stack: Stack<'gc, '_>,
 ) -> Result<impl Sequence<'gc>, Error<'gc>> {
     let str = crate::string::String::from_value(ctx, stack.get(0))?;
     Ok(FormatState {
@@ -713,12 +512,13 @@ impl<'gc> Sequence<'gc> for FormatState<'gc> {
     fn poll(
         self: Pin<&mut Self>,
         ctx: Context<'gc>,
-        _exec: crate::Execution<'gc, '_>,
-        stack: crate::Stack<'gc, '_>,
+        _exec: Execution<'gc, '_>,
+        stack: Stack<'gc, '_>,
     ) -> Result<SequencePoll<'gc>, Error<'gc>> {
         step(ctx, self.get_mut(), stack)
     }
 }
+
 #[derive(Collect)]
 #[collect(no_drop)]
 struct FormatState<'gc> {
@@ -730,6 +530,7 @@ struct FormatState<'gc> {
     #[collect(require_static)]
     inner: FormatStateInner,
 }
+
 enum FormatStateInner {
     Start,
     EvaluateCallback {
@@ -738,10 +539,11 @@ enum FormatStateInner {
     },
     End,
 }
+
 fn step<'gc>(
     ctx: Context<'gc>,
     state: &mut FormatState<'gc>,
-    mut stack: crate::Stack<'gc, '_>,
+    mut stack: Stack<'gc, '_>,
 ) -> Result<SequencePoll<'gc>, Error<'gc>> {
     let mut float_buf = [0u8; 300];
 
@@ -826,6 +628,7 @@ enum EvalPoll<'gc> {
         then: EvalContinuation,
     },
 }
+
 impl<'gc> EvalPoll<'gc> {
     fn from_metaresult(res: MetaResult<'gc, 1>, then: EvalContinuation) -> Self {
         match res {
@@ -872,10 +675,12 @@ fn evaluate_continuation<'gc, W: Write>(
                 .into_string(ctx)
                 .ok_or_else(|| FormatError::BadValueType(spec.spec, "string", val.type_name()))?;
 
-            let string = std::str::from_utf8(string.as_bytes())
+            let string = core::str::from_utf8(string.as_bytes())
                 .map_err(|_| FormatError::NonUnicodeString(spec.spec))?;
 
             let precision = args.precision.unwrap_or(string.len());
+
+            // Find the end byte of the string when truncated to `precision` chars.
             let (end_byte, end_char) = string
                 .char_indices()
                 .map(|(i, c)| i + c.len_utf8())
@@ -901,6 +706,7 @@ fn evaluate_specifier<'gc, W: Write>(
 ) -> Result<EvalPoll<'gc>, Error<'gc>> {
     match spec.spec {
         b'%' => {
+            // escaped %
             spec.check_flags(Flags::NONE)?;
             w.write_all(b"%")?;
         }
@@ -910,7 +716,7 @@ fn evaluate_specifier<'gc, W: Write>(
             let args = spec.common_args(values)?;
 
             let int = spec.next_int(values)?;
-            let byte: u8 = (int % 256) as u8;
+            let byte = (int % 256) as u8;
 
             let pad = args.pad_num_before(w, 1, 0, b"")?;
             w.write_all(&[byte])?;
@@ -922,11 +728,10 @@ fn evaluate_specifier<'gc, W: Write>(
             let args = spec.common_args(values)?;
 
             let int = spec.next_int(values)?;
-            let c: char = int
-                .try_into()
+            let c: char = u32::try_from(int)
                 .ok()
                 .and_then(char::from_u32)
-                .ok_or_else(|| FormatError::ValueOutOfRange(spec.spec))?;
+                .ok_or(FormatError::ValueOutOfRange(spec.spec))?;
 
             let pad = args.pad_num_before(w, 1, 0, b"")?;
             let s = c.encode_utf8(float_buf);
@@ -946,7 +751,6 @@ fn evaluate_specifier<'gc, W: Write>(
         }
         b'S' => {
             // utf-8 string
-            spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH | Flags::PRECISION)?;
             spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH | Flags::PRECISION)?;
             let args = spec.common_args(values)?;
             let val = spec.next_value(values)?;
@@ -1054,21 +858,19 @@ fn evaluate_specifier<'gc, W: Write>(
                 _ => unreachable!(),
             };
             let float = spec.next_float(values)?;
-            write_float(w, float, mode, args, float_buf)?;
+            float::write_float(w, float, mode, args, float_buf)?;
         }
         b'p' => {
             // pointer
             spec.check_flags(Flags::LEFT_ALIGN | Flags::WIDTH)?;
             let args = spec.common_args(values)?;
 
-            // TODO: is an intentional address-leak a bad idea?  Defeats ASLR
+            // TODO: is an intentional address-leak a bad idea?
+            // This defeats ASLR and simplifies potential exploits.
             // (though addrs are currently already exposed through tostring on fns/tables)
             let val = spec.next_value(values)?;
             let ptr = match val {
-                Value::Nil => 0,
-                Value::Boolean(_) => 0,
-                Value::Integer(_) => 0,
-                Value::Number(_) => 0,
+                Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => 0,
                 Value::String(str) => str.as_ptr() as usize,
                 Value::Table(t) => Gc::as_ptr(t.into_inner()) as usize,
                 Value::Function(Function::Closure(c)) => Gc::as_ptr(c.into_inner()) as usize,
@@ -1100,12 +902,13 @@ mod parse {
         base: &'a [u8],
         cur: &'a [u8],
     }
+
     impl<'a> PeekableIter<'a> {
         fn new(s: &'a [u8]) -> Self {
             Self { base: s, cur: s }
         }
         fn peek(&mut self) -> Option<u8> {
-            self.cur.get(0).copied()
+            self.cur.first().copied()
         }
         fn advance(&mut self) {
             self.cur = &self.cur[1..];
@@ -1115,7 +918,7 @@ mod parse {
         }
     }
 
-    pub fn parse_specifier<'gc>(
+    pub fn parse_specifier(
         str: &[u8],
         next: usize,
     ) -> Result<(FormatSpecifier, usize), FormatError> {
@@ -1123,7 +926,7 @@ mod parse {
 
         let mut flags = Flags::NONE;
         #[rustfmt::skip]
-        let _ = loop {
+        loop {
             match iter.peek() {
                 Some(b'#') => { iter.advance(); flags |= Flags::ALTERNATE; },
                 Some(b'-') => { iter.advance(); flags |= Flags::LEFT_ALIGN; },
@@ -1151,19 +954,17 @@ mod parse {
             OptionalArg::None
         };
 
-        let spec = iter.peek().ok_or_else(|| FormatError::BadSpec(FMT_SPEC))?;
+        let spec = iter.peek().ok_or(FormatError::BadSpec(FMT_SPEC))?;
         iter.advance();
         let spec_end = next + 1 + iter.cur_index();
 
-        Ok((
-            FormatSpecifier {
-                spec,
-                flags,
-                width,
-                precision,
-            },
-            spec_end,
-        ))
+        let specifier = FormatSpecifier {
+            spec,
+            flags,
+            width,
+            precision,
+        };
+        Ok((specifier, spec_end))
     }
 
     fn try_parse_optional_arg(iter: &mut PeekableIter<'_>) -> Result<OptionalArg, ()> {
@@ -1176,14 +977,13 @@ mod parse {
                 let rest = &iter.cur[1..];
                 let len = 1 + rest
                     .iter()
-                    .position(|c| !matches!(c, b'0'..=b'9'))
+                    .position(|c| !c.is_ascii_digit())
                     .unwrap_or(rest.len());
 
-                // Safety: We just verified that the string is only composed
-                // of ASCII characters between 0 and 9.
-                let slice = unsafe { std::str::from_utf8_unchecked(&iter.cur[..len]) };
+                // We just verified that the slice is only composed of '0'..'9'
+                let slice = core::str::from_utf8(&iter.cur[..len]).map_err(|_| ())?;
 
-                let num = slice.parse::<u32>().map_err(drop)?;
+                let num = slice.parse::<u32>().map_err(|_| ())?;
                 if num > ARG_MAX {
                     return Err(());
                 }
@@ -1192,5 +992,259 @@ mod parse {
             }
             _ => Ok(OptionalArg::None),
         }
+    }
+}
+
+mod float {
+    use core::cmp::Ordering;
+    use std::io::Write;
+
+    use super::{
+        format_into_buffer, integer_length, strip_nonsignificant_zeroes, FormatArgs, FormatError,
+    };
+    use crate::Error;
+
+    pub enum FloatMode {
+        Normal,
+        Exponent,
+        Compact,
+        Hex,
+    }
+
+    pub fn write_float<'gc, W: Write>(
+        w: &mut W,
+        float: f64,
+        mode: FloatMode,
+        args: FormatArgs,
+        float_buf: &mut [u8],
+    ) -> Result<(), Error<'gc>> {
+        let sign = args.sign_char(float.is_sign_negative());
+
+        let preserve_decimal = args.alternate;
+        let width = args.width;
+        let precision = args.precision.unwrap_or(6);
+
+        if !float.is_finite() {
+            return write_nonfinite_float(w, float, args, sign).map_err(Into::into);
+        }
+
+        if matches!(mode, FloatMode::Hex) {
+            return write_hex_float(w, float, args).map_err(Into::into);
+        }
+
+        if matches!(mode, FloatMode::Compact | FloatMode::Exponent) {
+            let p = if matches!(mode, FloatMode::Compact) {
+                precision.saturating_sub(1)
+            } else {
+                precision
+            };
+            let formatted = format_into_buffer(&mut *float_buf, format_args!("{:+.p$e}", float))?;
+
+            let idx = formatted.rfind('e').ok_or(FormatError::BadFloat)?;
+            let exp = formatted[idx + 1..]
+                .parse::<i16>()
+                .map_err(|_| FormatError::BadFloat)?;
+
+            // Note: Rust does not include a leading '+' in the exponent notation, but Lua does,
+            // so we must calculate the length manually.
+            let exp_len = 1 + integer_length(exp.unsigned_abs() as u64);
+
+            // Implementation of %g, following the description of the algorithm
+            // in Python's documentation:
+            // https://docs.python.org/3/library/string.html#format-specification-mini-language
+            if matches!(mode, FloatMode::Compact) && exp >= -4 && (exp as i64) < (precision as i64)
+            {
+                let p = (precision as i64 - 1 - exp as i64) as usize;
+
+                let formatted_compact;
+                if preserve_decimal {
+                    // Add a decimal at the end, in case Rust doesn't generate one; then strip it out
+                    let s = format_into_buffer(&mut *float_buf, format_args!("{:+.p$}.", float))?;
+                    if s[1..s.len() - 1].contains('.') {
+                        formatted_compact = &s[1..s.len() - 1];
+                    } else {
+                        formatted_compact = &s[1..];
+                    }
+                } else {
+                    let s = format_into_buffer(&mut *float_buf, format_args!("{:+.p$}", float))?;
+                    formatted_compact = strip_nonsignificant_zeroes(&s[1..]);
+                }
+
+                let len = formatted_compact.len();
+                let zero_width = if args.zero_pad { width } else { 0 };
+
+                let pad = args.pad_num_before(w, len, zero_width, sign)?;
+                write!(w, "{}", formatted_compact)?;
+                pad.finish_pad(w)?;
+            } else {
+                // exponent mode:
+                // [   ][-][000][a.bbb][e][+EE]
+
+                let mut mantissa = &formatted[1..idx];
+                if matches!(mode, FloatMode::Compact) && !preserve_decimal {
+                    mantissa = strip_nonsignificant_zeroes(mantissa);
+                }
+                let e = if args.upper { 'E' } else { 'e' };
+
+                let exp_len = exp_len.max(3);
+                let len = mantissa.len() + 1 + exp_len;
+                let zero_width = if args.zero_pad { width } else { 0 };
+
+                if preserve_decimal && !formatted.contains('.') {
+                    let pad = args.pad_num_before(w, len + 1, zero_width, sign)?;
+                    write!(w, "{mantissa}.{e}{exp:+03}")?;
+                    pad.finish_pad(w)?;
+                } else {
+                    let pad = args.pad_num_before(w, len, zero_width, sign)?;
+                    write!(w, "{mantissa}{e}{exp:+03}")?;
+                    pad.finish_pad(w)?;
+                }
+            }
+        } else {
+            // normal float
+            // This can be larger than any reasonable buffer, so we have
+            // to forward everything to std (or find a float serialization
+            // library with custom formatting support.)
+
+            // TODO: cannot support the '#' preserving decimal mode
+            // string.format("'%#.0f'", 1) should result in "1."
+            match (args.left_align, args.zero_pad, sign) {
+                (false, false, b"" | b"-") => write!(w, "{float:width$.precision$}")?,
+                (false, true, b"" | b"-") => write!(w, "{float:>0width$.precision$}")?,
+                (false, false, b"+") => write!(w, "{float:+width$.precision$}")?,
+                (false, true, b"+") => write!(w, "{float:>+0width$.precision$}")?,
+                (false, false, b" ") => write!(w, " {float:width$.precision$}")?,
+                (false, true, b" ") => write!(w, " {float:>0width$.precision$}")?,
+                (true, _, b"" | b"-") => write!(w, "{float:<width$.precision$}")?,
+                (true, _, b"+") => write!(w, "{float:<+width$.precision$}")?,
+                (true, _, b" ") => write!(w, " {float:<width$.precision$}")?,
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_nonfinite_float<W: Write>(
+        w: &mut W,
+        float: f64,
+        args: FormatArgs,
+        sign: &[u8],
+    ) -> Result<(), std::io::Error> {
+        let s = match (float.is_infinite(), args.upper) {
+            (true, false) => "inf",
+            (true, true) => "INF",
+            (false, false) => "nan",
+            (false, true) => "NAN",
+        };
+        let pad = args.pad_num_before(w, s.len(), 0, sign)?;
+        write!(w, "{s}")?;
+        pad.finish_pad(w)?;
+        Ok(())
+    }
+
+    const F64_EXPONENT_BITS: u32 = 11;
+    const F64_MANTISSA_BITS: u32 = 52;
+    const F64_EXP_OFFSET: i16 = -(1 << (F64_EXPONENT_BITS - 1)) + 1;
+
+    #[inline]
+    const fn bitselect(n: u64, off: u32, count: u32) -> u64 {
+        (n >> off) & ((1 << count) - 1)
+    }
+
+    fn round_mantissa(mantissa: u64, exp_bits: u16, precision: usize) -> (u64, u64) {
+        let leading_bit = (exp_bits != 0) as u64;
+        let mantissa = mantissa | (leading_bit << F64_MANTISSA_BITS);
+        let used_mantissa_bits = (precision as u32 * 4).min(F64_MANTISSA_BITS);
+
+        let remainder_bits = F64_MANTISSA_BITS - used_mantissa_bits as u32;
+        let quotient = mantissa >> remainder_bits;
+        let remainder = bitselect(mantissa, 0, remainder_bits);
+        let rounded_quotient = match remainder.cmp(&(1 << remainder_bits.saturating_sub(1))) {
+            Ordering::Less => quotient,
+            Ordering::Equal => (quotient + 1) & !1, // Round to even
+            Ordering::Greater => quotient + 1,
+        };
+
+        let head = rounded_quotient >> used_mantissa_bits;
+        let rounded_div_mantissa = bitselect(rounded_quotient, 0, used_mantissa_bits);
+        (head, rounded_div_mantissa)
+    }
+
+    pub fn write_hex_float<W: Write>(
+        w: &mut W,
+        float: f64,
+        args: FormatArgs,
+    ) -> Result<(), std::io::Error> {
+        let sign = args.sign_char(float.is_sign_negative());
+        let preserve_decimal = args.alternate;
+
+        if !float.is_finite() {
+            return write_nonfinite_float(w, float, args, sign);
+        }
+
+        let width = args.width;
+        let mut precision = args
+            .precision
+            .unwrap_or(F64_MANTISSA_BITS.div_ceil(4) as usize);
+
+        let bits = f64::to_bits(float);
+        let exp_bits = bitselect(bits, F64_MANTISSA_BITS, F64_EXPONENT_BITS);
+        // clamp exponent to -1022 for subnormals
+        let mut exp = (exp_bits as i16 + F64_EXP_OFFSET).max(-1022);
+        let mantissa = bitselect(bits, 0, F64_MANTISSA_BITS);
+
+        if float == 0.0 {
+            exp = 0;
+        }
+
+        let (head, mut mantissa) = round_mantissa(mantissa, exp_bits as u16, precision);
+
+        let prefix: &[u8] = match (sign, args.upper) {
+            (b"", false) => b"0x",
+            (b"-", false) => b"-0x",
+            (b"+", false) => b"+0x",
+            (b" ", false) => b" 0x",
+            (b"", true) => b"0X",
+            (b"-", true) => b"-0X",
+            (b"+", true) => b"+0X",
+            (b" ", true) => b" 0X",
+            _ => unreachable!(),
+        };
+        let zero_width = if args.zero_pad {
+            width.saturating_sub(prefix.len())
+        } else {
+            0
+        };
+
+        if args.precision.is_none() {
+            let trailing_zero_digits = mantissa.trailing_zeros().min(F64_MANTISSA_BITS) / 4;
+            mantissa = mantissa >> (trailing_zero_digits * 4);
+            precision = precision.saturating_sub(trailing_zero_digits as usize);
+        }
+
+        if precision != 0 {
+            let m_width = precision;
+            let len = 2 + m_width + 1 + 1 + integer_length(exp.unsigned_abs() as u64);
+
+            let pad = args.pad_num_before(w, len, zero_width, prefix)?;
+            if args.upper {
+                write!(w, "{head}.{mantissa:0m_width$X}P{exp:+}")?;
+            } else {
+                write!(w, "{head}.{mantissa:0m_width$x}p{exp:+}")?;
+            }
+            pad.finish_pad(w)?;
+        } else {
+            let len = 3 + preserve_decimal as usize + integer_length(exp.unsigned_abs() as u64);
+
+            let p = if args.upper { 'P' } else { 'p' };
+            let pad = args.pad_num_before(w, len, zero_width, prefix)?;
+            if preserve_decimal {
+                write!(w, "{head}.{p}{exp:+}")?;
+            } else {
+                write!(w, "{head}{p}{exp:+}")?;
+            }
+            pad.finish_pad(w)?;
+        }
+        Ok(())
     }
 }
